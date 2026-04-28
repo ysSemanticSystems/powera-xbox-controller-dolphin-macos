@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# Strip unwanted commit trailers that some tools inject.
+# This is repo-local and does not touch global git config.
+#
+set -eu
+
+msg_file="$1"
+
+# Delete exact trailer lines.
+tmp="${msg_file}.tmp"
+sed '/^Made-with: Cursor$/d' "$msg_file" > "$tmp"
+mv "$tmp" "$msg_file"
+
