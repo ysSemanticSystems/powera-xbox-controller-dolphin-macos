@@ -162,11 +162,10 @@ impl LayoutStats {
         let btn_changes = self.buttons_change_count as f32 / s;
         let btn_pop_avg = self.buttons_popcount_sum as f32 / s;
 
-        // Heuristics:
-        // - triggers should almost always look 10-bit => trig_hi_zero near 1.0
-        // - axes should not be saturated and should show some movement => axes_* high
-        // - buttons should not change constantly (noise), but should change sometimes => btn_changes moderate
-        // - average popcount should be small (few pressed at a time), not ~8-16.
+        // Layout selection is deliberately heuristic. We want to find a stable window that behaves like:
+        // - a sparse button bitfield (low popcount, occasional edges)
+        // - 10-bit triggers in 16-bit words (high bits usually zero)
+        // - 4× i16 axes (not saturated, some activity when sticks move)
         let mut score = 0.0f32;
         score += 6.0 * trig_hi_zero;
         score += 2.0 * trig_activity;
@@ -362,6 +361,7 @@ fn open_pipe_writer_wait(path: &Path) -> Result<fs::File> {
             Err(e) => {
                 if let Some(ioe) = e.downcast_ref::<io::Error>() {
                     if ioe.raw_os_error() == Some(libc::ENXIO) {
+                        // ENXIO is expected when the FIFO exists but no reader (Dolphin) is connected yet.
                         std::thread::sleep(Duration::from_millis(250));
                         continue;
                     }
@@ -529,12 +529,14 @@ fn main() -> Result<()> {
 
         let pkt = &buf[..n];
 
-        // Only treat 0x20 packets as input-state. Other command bytes exist and should be ignored.
+        // Only 0x20 carries the input-state payload we care about. Other command bytes are
+        // part of the GIP session and should not be interpreted as controller state.
         if pkt.first().copied() != Some(0x20) {
             continue;
         }
 
-        // Robust layout detection: collect stats for 2 seconds, then lock.
+        // Robust layout detection: collect stats briefly, then lock and emit inputs.
+        // This avoids emitting garbage mappings while the offset is still ambiguous.
         if payload_offset.is_none() {
             let payload = &pkt[2..];
             let max_off = payload.len().saturating_sub(14);

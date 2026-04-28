@@ -1,61 +1,59 @@
-# PowerA Xbox Controller Fix for Dolphin (macOS)
+# PowerA Xbox controller input for Dolphin on macOS
 
-If you plugged in a wired PowerA Xbox-style controller into macOS and **Dolphin doesn’t see any inputs**, this is for you.
-Some PowerA controllers show up on USB, but macOS does not interpret their controller data, so apps never receive button or stick events.
+This project bridges certain **wired PowerA Xbox-style controllers** to **Dolphin Emulator** on macOS by using Dolphin’s built-in **Pipe** input backend.
 
-This project is a small background program that runs while Dolphin is open and:
+It reads the controller directly over USB (Game Input Protocol / “GIP”), then writes controller events to a named pipe that Dolphin can consume.
 
-- Reads the controller directly over USB
-- Translates sticks/buttons/triggers into Dolphin's Pipe input protocol
-- Sends that input to **Dolphin Emulator** using Dolphin’s built-in **Pipe** controller backend
+- **No kernel extensions**
+- **No SIP changes**
+- **No virtual HID**
 
-No kernel extensions. No SIP changes. You typically run it with `sudo` so it can access the USB device.
+## Supported controller(s)
 
-## Will it work with my controller?
-
-Right now, it is **confirmed for one specific model** (hard-coded Vendor ID / Product ID):
+Confirmed working:
 
 - **PowerA Xbox Series X Advantage Hall Effect Wired Controller**
-  - **VID**: `0x20D6`
-  - **PID**: `0x2079`
+  - **Vendor ID (VID)**: `0x20D6`
+  - **Product ID (PID)**: `0x2079`
 
-It **might** work for other *wired* PowerA Xbox-style controllers that use Microsoft's GIP (Game Input Protocol), but that is not guaranteed.
-If your controller has a different VID/PID, support usually means: add the VID/PID and confirm the packet layout.
+Other wired PowerA Xbox-style controllers may work if they use GIP and the packet layout matches (or is close). Adding support usually means whitelisting additional VID/PIDs and verifying the input report layout.
 
-## Status
+## Requirements
 
-- **USB open + claim + init packet**: implemented
-- **Input parsing**: implements a common GIP `0x20` input packet layout
-- **Dolphin Pipe output**: implemented (PRESS/RELEASE + SET MAIN/C/L/R)
-- **Auto payload offset detection**: implemented
+- Rust toolchain
+- Dolphin Emulator (any build with Pipe input support)
 
-## Quick start
+## Run
 
-1. **Run the program**
-
-On macOS, accessing a vendor-specific USB controller usually requires root privileges:
+On macOS, claiming a vendor-specific USB interface typically requires root privileges:
 
 ```bash
 make run
 ```
 
-2. **Tell Dolphin to use the Pipe backend**
+## Dolphin setup (Pipe backend)
 
-The program writes to this pipe (it will create the directory and FIFO automatically if missing):
+The program writes to:
 
 - `~/Library/Application Support/Dolphin/Pipes/powera`
 
+It will create the directory and FIFO automatically if missing.
+
 In Dolphin:
 
-- Controllers → Standard Controller → Configure → Device dropdown: `Pipe/0/powera`
+- Controllers → Standard Controller → Configure → Device: `Pipe/0/powera`
 
-3. **Map controls inside Dolphin**
+## What it emits (Pipe protocol)
 
-In Dolphin’s controller mapping UI, bind buttons/axes as you prefer. This program emits:
+You can bind these in Dolphin’s controller mapping UI:
 
-- Buttons: `A B X Y Z START D_UP D_DOWN D_LEFT D_RIGHT`
-- Sticks: `SET MAIN x y` (left stick), `SET C x y` (right stick)
-- Triggers: `SET L value`, `SET R value` (analog 0–1)
+- **Buttons**: `A B X Y Z START D_UP D_DOWN D_LEFT D_RIGHT`
+- **Sticks**:
+  - `SET MAIN x y` (left stick)
+  - `SET C x y` (right stick)
+- **Triggers**:
+  - `SET L value` (left trigger, 0–1)
+  - `SET R value` (right trigger, 0–1)
 
 ## Build (optional)
 
@@ -63,17 +61,16 @@ In Dolphin’s controller mapping UI, bind buttons/axes as you prefer. This prog
 make build
 ```
 
-If you want to build/run without `make`:
+Or:
 
 ```bash
 CARGO_TARGET_DIR=target cargo build --release
 sudo ./target/release/xbox_controller_macos_gip
 ```
 
-## Debugging / failure modes
+## Troubleshooting
 
-- **USB claim fails**: likely permission/device-busy. Try unplug/replug, quit any software that might open it.
-- **Init sends but no input arrives**: endpoints may be different; we auto-detect interrupt IN/OUT from descriptors.
-- **Input arrives but parses wrong**: the program prints raw hex for the first few parse failures.
-- **Pipe doesn’t connect**: Dolphin hasn’t opened it yet. Set Device to `Pipe/0/powera` and keep the config window open.
+- **Pipe doesn’t connect**: Dolphin hasn’t opened the pipe yet. Set the Device to `Pipe/0/powera` and keep the controller config window open.
+- **USB claim fails**: try unplug/replug, quit other apps that may be accessing the controller, then re-run with `sudo`.
+- **Inputs register but are wrong**: re-bind in Dolphin after updates; the program may change its mapping as support improves.
 
