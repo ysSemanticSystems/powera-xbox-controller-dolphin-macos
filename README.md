@@ -1,6 +1,6 @@
 # PowerA Xbox Controller → Dolphin (macOS)
 
-If you plugged in a wired Xbox-style controller on macOS and **nothing happens in Dolphin**, you’re not alone.
+If you plugged in a wired Xbox-style controller on macOS and **Dolphin doesn’t see it**, you’re not alone.
 Some controllers show up on USB but don’t have a macOS driver that understands their data.
 
 This project is a small background program (“daemon”) that:
