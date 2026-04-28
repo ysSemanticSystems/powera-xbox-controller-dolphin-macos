@@ -1,4 +1,4 @@
-APP_NAME := xbox_controller_macos_gip
+APP_NAME := gipbridge
 
 .PHONY: build run clean
 

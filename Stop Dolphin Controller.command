@@ -4,7 +4,7 @@ set -euo pipefail
 # Best-effort stop: kill the running bridge process.
 # (We avoid extra dependencies and keep this simple.)
 
-APP="xbox_controller_macos_gip"
+APP="gipbridge"
 
 echo ""
 echo "Stopping PowerA → Dolphin pipe bridge…"

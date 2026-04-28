@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use clap::Parser;
 use rusb::{Context as RusbContext, DeviceHandle, Direction, TransferType, UsbContext};
 use std::ffi::CString;
 use std::fs;
@@ -9,8 +10,46 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-const VID: u16 = 0x20D6;
-const PID: u16 = 0x2079;
+const KNOWN_CONTROLLERS: &[(u16, u16, &str)] = &[
+    (0x20D6, 0x2079, "PowerA Xbox Series X Advantage Hall Effect Wired"),
+    (0x20D6, 0x2009, "PowerA Enhanced Wired Controller for Xbox Series X|S"),
+    (0x20D6, 0x200E, "PowerA Spectra Infinity Enhanced Wired Controller"),
+    (0x20D6, 0x2064, "PowerA Wired Controller for Xbox"),
+    (0x20D6, 0x281F, "PowerA Wired Controller For Xbox 360"),
+    (0x20D6, 0x2001, "BDA / PowerA Xbox Series X Wired Controller"),
+    (0x20D6, 0x2003, "PowerA Xbox Series X Fusion Pro 2 Wired"),
+    (
+        0x20D6,
+        0x2004,
+        "PowerA Enhanced Wired Controller (Xbox Series X EnWired Pink Inline)",
+    ),
+    (0x0E6F, 0x0139, "PDP Afterglow Prismatic Wired Xbox One"),
+    (0x0E6F, 0x013A, "PDP Xbox One Controller"),
+    (0x0E6F, 0x0146, "PDP Rock Candy Wired for Xbox One"),
+    (0x0E6F, 0x0161, "PDP Xbox One Controller"),
+    (0x0E6F, 0x0162, "PDP Xbox One Controller"),
+    (0x0E6F, 0x0163, "PDP Xbox One Controller"),
+    (0x0E6F, 0x0164, "PDP Battlefield 1 Xbox One"),
+    (0x0E6F, 0x0165, "PDP Titanfall 2 Xbox One"),
+    (0x0F0D, 0x0067, "HORI Pad Pro Xbox One"),
+    (0x0F0D, 0x0078, "HORI Real Arcade Pro V Kai Xbox One"),
+    (0x24C6, 0x541A, "PowerA Xbox One Mini"),
+    (0x24C6, 0x542A, "PowerA Xbox One Spectra"),
+    (0x24C6, 0x543A, "PowerA Xbox One"),
+    (0x24C6, 0x551A, "PowerA Fusion Pro Wired Xbox One"),
+    (0x24C6, 0x561A, "PowerA Xbox One Cabled"),
+    (0x24C6, 0x581A, "PowerA Enhanced Wired (3rd party)"),
+    (0x045E, 0x02DD, "Microsoft Xbox One Controller (wired, post-2015)"),
+    (0x045E, 0x02E3, "Microsoft Xbox One Elite Controller (wired)"),
+    (0x045E, 0x02EA, "Microsoft Xbox One S Controller (wired)"),
+    (
+        0x045E,
+        0x02FD,
+        "Microsoft Xbox One S Controller (Bluetooth firmware, USB)",
+    ),
+    (0x045E, 0x0B00, "Microsoft Xbox One Elite Series 2 (wired)"),
+    (0x045E, 0x0B12, "Microsoft Xbox Series X|S Controller (wired)"),
+];
 
 const GIP_INIT_PACKET: [u8; 5] = [0x05, 0x20, 0x00, 0x01, 0x00];
 
@@ -20,7 +59,6 @@ const ANALOG_EPS: f32 = 0.0025;
 const ANALOG_MAX_HZ: f32 = 120.0;
 
 // Stick tuning.
-const STICK_DEADZONE: f32 = 0.12; // radial deadzone in [-1,1] space
 const CALIBRATION_WINDOW: Duration = Duration::from_millis(750);
 const CALIBRATION_MAX_RADIUS: f32 = 0.25; // only learn center when stick is near center
 
@@ -29,6 +67,54 @@ const CALIBRATION_MAX_RADIUS: f32 = 0.25; // only learn center when stick is nea
 // This must be robust because getting the offset wrong causes "everything triggers everything".
 const LAYOUT_DETECT_WINDOW: Duration = Duration::from_secs(2);
 const LAYOUT_MIN_SAMPLES: u32 = 120;
+
+#[derive(Parser, Debug)]
+#[command(name = "gipbridge", about = None, long_about = None)]
+struct Cli {
+    /// Override VID (e.g. 0x20D6). If set, --pid must also be set.
+    #[arg(long)]
+    vid: Option<String>,
+    /// Override PID (e.g. 0x2079). If set, --vid must also be set.
+    #[arg(long)]
+    pid: Option<String>,
+    /// Pipe filename under ~/Library/Application Support/Dolphin/Pipes/ (default: powera)
+    #[arg(long, default_value = "powera")]
+    pipe_name: String,
+    /// Do not invert stick Y axes (default: invert)
+    #[arg(long)]
+    no_y_invert: bool,
+    /// Radial stick deadzone in [0,1] (default: 0.12)
+    #[arg(long, default_value_t = 0.12)]
+    deadzone: f32,
+    /// Print raw hex for every input packet received
+    #[arg(long)]
+    dump: bool,
+    /// Print known supported controllers and exit.
+    #[arg(long)]
+    list: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BridgeConfig {
+    y_invert: bool,
+    deadzone: f32,
+}
+
+fn parse_u16_maybe_hex(s: &str) -> Result<u16> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    // Prefer hex if it contains hex letters, otherwise accept decimal too.
+    let is_hexish = t.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F'));
+    let v = if is_hexish {
+        u32::from_str_radix(t, 16).map_err(|e| anyhow!("invalid hex value '{s}': {e}"))?
+    } else if t.chars().all(|c| c.is_ascii_digit()) {
+        t.parse::<u32>()
+            .map_err(|e| anyhow!("invalid decimal value '{s}': {e}"))?
+    } else {
+        u32::from_str_radix(t, 16).map_err(|e| anyhow!("invalid value '{s}': {e}"))?
+    };
+    u16::try_from(v).map_err(|_| anyhow!("value out of range for u16: {s}"))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ParsedInput {
@@ -258,7 +344,7 @@ fn apply_radial_deadzone(x: f32, y: f32, dz: f32) -> (f32, f32) {
     (clamp11(x * s), clamp11(y * s))
 }
 
-fn parsed_to_dolphin(p: ParsedInput, cal: StickCalibration) -> DolphinState {
+fn parsed_to_dolphin(p: ParsedInput, cal: StickCalibration, cfg: BridgeConfig) -> DolphinState {
     let b = p.buttons;
 
     // GIP 0x20 button word layout (per Linux xpad / medusalix xone reference drivers):
@@ -286,14 +372,22 @@ fn parsed_to_dolphin(p: ParsedInput, cal: StickCalibration) -> DolphinState {
     let rx = clamp11(norm_i16_to_f1(p.rx) - cal.rx0);
     let ry = clamp11(norm_i16_to_f1(p.ry) - cal.ry0);
 
-    let (lx, ly) = apply_radial_deadzone(lx, ly, STICK_DEADZONE);
-    let (rx, ry) = apply_radial_deadzone(rx, ry, STICK_DEADZONE);
+    let (lx, ly) = apply_radial_deadzone(lx, ly, cfg.deadzone);
+    let (rx, ry) = apply_radial_deadzone(rx, ry, cfg.deadzone);
 
     // Dolphin pipe uses 0..1. Keep Y inverted so up is larger (we can flip later if needed).
     let main_x = clamp01((lx + 1.0) * 0.5);
-    let main_y = clamp01(((-ly) + 1.0) * 0.5);
+    let main_y = if cfg.y_invert {
+        clamp01(((-ly) + 1.0) * 0.5)
+    } else {
+        clamp01(((ly) + 1.0) * 0.5)
+    };
     let c_x = clamp01((rx + 1.0) * 0.5);
-    let c_y = clamp01(((-ry) + 1.0) * 0.5);
+    let c_y = if cfg.y_invert {
+        clamp01(((-ry) + 1.0) * 0.5)
+    } else {
+        clamp01(((ry) + 1.0) * 0.5)
+    };
 
     let l = norm_trig10_to_01(p.lt10);
     let r = norm_trig10_to_01(p.rt10);
@@ -318,14 +412,20 @@ fn parsed_to_dolphin(p: ParsedInput, cal: StickCalibration) -> DolphinState {
     }
 }
 
-fn default_pipe_path() -> Result<PathBuf> {
+fn default_pipe_path(pipe_name: &str) -> Result<PathBuf> {
+    if pipe_name.contains('/') {
+        bail!("--pipe-name must not contain '/'");
+    }
+    if pipe_name.as_bytes().iter().any(|&b| b == 0) {
+        bail!("--pipe-name must not contain NUL");
+    }
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("Application Support")
         .join("Dolphin")
         .join("Pipes")
-        .join("powera"))
+        .join(pipe_name))
 }
 
 fn ensure_fifo(path: &Path) -> Result<()> {
@@ -462,32 +562,100 @@ fn find_interrupt_endpoints(handle: &mut DeviceHandle<RusbContext>) -> Result<(u
         }
     }
 
-    bail!(
-        "could not find interface with BOTH interrupt IN and interrupt OUT endpoints (VID=0x{VID:04X}, PID=0x{PID:04X})"
-    )
+    bail!("could not find interface with BOTH interrupt IN and interrupt OUT endpoints")
 }
 
-fn open_controller(ctx: &RusbContext) -> Result<DeviceHandle<RusbContext>> {
-    let handle = ctx
-        .open_device_with_vid_pid(VID, PID)
-        .ok_or_else(|| anyhow!("device not found (VID=0x{VID:04X}, PID=0x{PID:04X})"))?;
+fn list_supported_and_exit() -> Result<()> {
+    for (vid, pid, name) in KNOWN_CONTROLLERS {
+        println!("0x{vid:04X}:0x{pid:04X}  {name}");
+    }
+    Ok(())
+}
 
-    let dev = handle.device();
-    let cfg = dev.active_config_descriptor().ok().map(|c| c.number()).unwrap_or(1);
-    let _ = handle.set_active_configuration(cfg);
-    let _ = handle.set_auto_detach_kernel_driver(true);
-    Ok(handle)
+fn open_controller(
+    ctx: &RusbContext,
+    override_vid_pid: Option<(u16, u16)>,
+) -> Result<(DeviceHandle<RusbContext>, u16, u16, &'static str)> {
+    if let Some((vid, pid)) = override_vid_pid {
+        let handle = ctx
+            .open_device_with_vid_pid(vid, pid)
+            .ok_or_else(|| anyhow!("device not found (VID=0x{vid:04X}, PID=0x{pid:04X})"))?;
+
+        let dev = handle.device();
+        let cfg = dev.active_config_descriptor().ok().map(|c| c.number()).unwrap_or(1);
+        let _ = handle.set_active_configuration(cfg);
+        let _ = handle.set_auto_detach_kernel_driver(true);
+        return Ok((handle, vid, pid, "Override device"));
+    }
+
+    let devices = ctx.devices().context("usb device list")?;
+    for dev in devices.iter() {
+        let dd = match dev.device_descriptor() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let vid = dd.vendor_id();
+        let pid = dd.product_id();
+        if let Some((_, _, name)) = KNOWN_CONTROLLERS
+            .iter()
+            .find(|(kvid, kpid, _)| *kvid == vid && *kpid == pid)
+        {
+            let handle = match dev.open() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let cfg = dev.active_config_descriptor().ok().map(|c| c.number()).unwrap_or(1);
+            let _ = handle.set_active_configuration(cfg);
+            let _ = handle.set_auto_detach_kernel_driver(true);
+            return Ok((handle, vid, pid, *name));
+        }
+    }
+
+    eprintln!("No known supported controller found.");
+    eprintln!("Connected USB devices (VID:PID):");
+    for dev in ctx.devices().context("usb device list")?.iter() {
+        if let Ok(dd) = dev.device_descriptor() {
+            eprintln!("  0x{:04X}:0x{:04X}", dd.vendor_id(), dd.product_id());
+        }
+    }
+    eprintln!();
+    eprintln!("Try: gipbridge --vid 0xVVVV --pid 0xPPPP");
+    bail!("no supported controller connected")
 }
 
 fn main() -> Result<()> {
-    println!("Opening PowerA controller (VID=0x{VID:04X}, PID=0x{PID:04X})…");
+    let cli = Cli::parse();
+
+    if cli.list {
+        list_supported_and_exit()?;
+        return Ok(());
+    }
+
+    let override_vid_pid = match (&cli.vid, &cli.pid) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("--vid and --pid must be provided together");
+        }
+        (Some(vs), Some(ps)) => Some((parse_u16_maybe_hex(vs)?, parse_u16_maybe_hex(ps)?)),
+    };
+
+    let deadzone = cli.deadzone.clamp(0.0, 0.5);
+    let cfg = BridgeConfig {
+        y_invert: !cli.no_y_invert,
+        deadzone,
+    };
+
+    println!("gipbridge starting…");
     println!("Note: on macOS this usually needs to run as root (sudo) to claim a vendor-class USB interface.");
     let _ = io::stdout().flush();
 
-    let pipe_path = default_pipe_path()?;
+    let pipe_path = default_pipe_path(&cli.pipe_name)?;
     ensure_fifo(&pipe_path)?;
     println!("Dolphin Pipe path: {}", pipe_path.display());
-    println!("In Dolphin: Controllers → Standard Controller → Configure → Device: Pipe/0/powera");
+    println!(
+        "In Dolphin: Controllers → Standard Controller → Configure → Device: Pipe/0/{}",
+        cli.pipe_name
+    );
     println!("Waiting for Dolphin to open the pipe…");
     let _ = io::stdout().flush();
     let mut pipe = open_pipe_writer_wait(&pipe_path)?;
@@ -495,7 +663,8 @@ fn main() -> Result<()> {
     let _ = io::stdout().flush();
 
     let usb = RusbContext::new().context("libusb init")?;
-    let mut handle = open_controller(&usb)?;
+    let (mut handle, vid, pid, name) = open_controller(&usb, override_vid_pid)?;
+    println!("Opened {name} (VID=0x{vid:04X}, PID=0x{pid:04X})");
     let (iface, in_ep, out_ep) = find_interrupt_endpoints(&mut handle)?;
     println!("Claimed interface {iface}, interrupt IN=0x{in_ep:02X}, OUT=0x{out_ep:02X}");
     let _ = io::stdout().flush();
@@ -528,6 +697,10 @@ fn main() -> Result<()> {
         };
 
         let pkt = &buf[..n];
+
+        if cli.dump {
+            println!("RAW {}", hex::encode(pkt));
+        }
 
         // Only 0x20 carries the input-state payload we care about. Other command bytes are
         // part of the GIP session and should not be interpreted as controller state.
@@ -592,7 +765,7 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                let now_state = parsed_to_dolphin(parsed, cal);
+                let now_state = parsed_to_dolphin(parsed, cal, cfg);
                 if let Err(e) = emit_state_delta(&mut pipe, prev_state, now_state, &mut last_analog_emit) {
                     if let Some(ioe) = e.downcast_ref::<io::Error>() {
                         if ioe.raw_os_error() == Some(libc::EPIPE) {

@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo ""
-echo "PowerA → Dolphin pipe bridge"
+echo "gipbridge (GIP → Dolphin pipe)"
 echo "----------------------------------------"
 echo "This will build (if needed) and start the bridge."
 echo "You will be prompted for your password (sudo) for USB access."
