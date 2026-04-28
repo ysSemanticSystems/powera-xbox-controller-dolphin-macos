@@ -114,7 +114,3 @@ Protocol references:
   - [`medusalix/xone`](https://github.com/medusalix/xone) — userspace-friendly GIP protocol documentation.
   - Dolphin Emulator's named-pipe controller backend ([`Pipes.h`](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/InputCommon/ControllerInterface/Pipes/Pipes.h)) — the escape hatch that makes the whole approach possible without a virtual HID device or DriverKit entitlement.
 
-## License
-
-[choose one — MIT or Apache-2.0 recommended for a project like this]
-
