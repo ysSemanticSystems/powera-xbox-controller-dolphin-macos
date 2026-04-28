@@ -19,6 +19,11 @@ const RAW_DUMP_PACKETS: usize = 10;
 const ANALOG_EPS: f32 = 0.0025;
 const ANALOG_MAX_HZ: f32 = 120.0;
 
+// Stick tuning.
+const STICK_DEADZONE: f32 = 0.12; // radial deadzone in [-1,1] space
+const CALIBRATION_WINDOW: Duration = Duration::from_millis(750);
+const CALIBRATION_MAX_RADIUS: f32 = 0.25; // only learn center when stick is near center
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ParsedInput {
     buttons: u16,
@@ -144,15 +149,52 @@ fn clamp01(v: f32) -> f32 {
     }
 }
 
-fn norm_i16_to_01(v: i16) -> f32 {
-    clamp01((v as f32 + 32768.0) / 65535.0)
+fn clamp11(v: f32) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else if v < -1.0 {
+        -1.0
+    } else if v > 1.0 {
+        1.0
+    } else {
+        v
+    }
+}
+
+fn norm_i16_to_f1(v: i16) -> f32 {
+    // Map i16 to [-1, 1]. Keep symmetric behavior around 0.
+    if v == i16::MIN {
+        -1.0
+    } else {
+        (v as f32) / 32767.0
+    }
 }
 
 fn norm_trig10_to_01(v10: u16) -> f32 {
     clamp01((v10.min(1023) as f32) / 1023.0)
 }
 
-fn parsed_to_dolphin(p: ParsedInput) -> DolphinState {
+#[derive(Clone, Copy, Debug, Default)]
+struct StickCalibration {
+    lx0: f32,
+    ly0: f32,
+    rx0: f32,
+    ry0: f32,
+    n: u32,
+}
+
+fn apply_radial_deadzone(x: f32, y: f32, dz: f32) -> (f32, f32) {
+    let r = (x * x + y * y).sqrt();
+    if r <= dz {
+        return (0.0, 0.0);
+    }
+    // Rescale so output starts at 0 at the edge of the deadzone.
+    let k = (r - dz) / (1.0 - dz);
+    let s = if r > 0.0 { k / r } else { 0.0 };
+    (clamp11(x * s), clamp11(y * s))
+}
+
+fn parsed_to_dolphin(p: ParsedInput, cal: StickCalibration) -> DolphinState {
     let b = p.buttons;
 
     let d_up = (b & 0x0001) != 0;
@@ -170,10 +212,20 @@ fn parsed_to_dolphin(p: ParsedInput) -> DolphinState {
 
     let z = view;
 
-    let main_x = norm_i16_to_01(p.lx);
-    let main_y = 1.0 - norm_i16_to_01(p.ly);
-    let c_x = norm_i16_to_01(p.rx);
-    let c_y = 1.0 - norm_i16_to_01(p.ry);
+    // Convert to [-1,1], subtract learned centers, apply deadzone, then map to [0,1].
+    let lx = clamp11(norm_i16_to_f1(p.lx) - cal.lx0);
+    let ly = clamp11(norm_i16_to_f1(p.ly) - cal.ly0);
+    let rx = clamp11(norm_i16_to_f1(p.rx) - cal.rx0);
+    let ry = clamp11(norm_i16_to_f1(p.ry) - cal.ry0);
+
+    let (lx, ly) = apply_radial_deadzone(lx, ly, STICK_DEADZONE);
+    let (rx, ry) = apply_radial_deadzone(rx, ry, STICK_DEADZONE);
+
+    // Dolphin pipe uses 0..1. Keep Y inverted so up is larger (we can flip later if needed).
+    let main_x = clamp01((lx + 1.0) * 0.5);
+    let main_y = clamp01(((-ly) + 1.0) * 0.5);
+    let c_x = clamp01((rx + 1.0) * 0.5);
+    let c_y = clamp01(((-ry) + 1.0) * 0.5);
 
     let l = norm_trig10_to_01(p.lt10);
     let r = norm_trig10_to_01(p.rt10);
@@ -393,6 +445,8 @@ fn main() -> Result<()> {
     let mut payload_offset: Option<usize> = None;
     let mut prev_state = DolphinState::default();
     let mut last_analog_emit = Instant::now();
+    let mut cal = StickCalibration::default();
+    let cal_start = Instant::now();
 
     loop {
         let n = match handle.read_interrupt(in_ep, &mut buf, Duration::from_secs(1)) {
@@ -402,6 +456,11 @@ fn main() -> Result<()> {
         };
 
         let pkt = &buf[..n];
+
+        // Only treat 0x20 packets as input-state. Other command bytes exist and should be ignored.
+        if pkt.first().copied() != Some(0x20) {
+            continue;
+        }
 
         if payload_offset.is_none() {
             payload_offset = detect_payload_offset(pkt);
@@ -413,7 +472,27 @@ fn main() -> Result<()> {
         let off = payload_offset.unwrap_or(0);
         match parse_gip_input_packet(pkt, off) {
             Ok(parsed) => {
-                let now_state = parsed_to_dolphin(parsed);
+                // Learn stick centers briefly at startup (only when near center).
+                if cal_start.elapsed() <= CALIBRATION_WINDOW {
+                    let lx = norm_i16_to_f1(parsed.lx);
+                    let ly = norm_i16_to_f1(parsed.ly);
+                    let rx = norm_i16_to_f1(parsed.rx);
+                    let ry = norm_i16_to_f1(parsed.ry);
+
+                    let lrad = (lx * lx + ly * ly).sqrt();
+                    let rrad = (rx * rx + ry * ry).sqrt();
+                    if lrad <= CALIBRATION_MAX_RADIUS && rrad <= CALIBRATION_MAX_RADIUS {
+                        cal.n = cal.n.saturating_add(1);
+                        let n = cal.n as f32;
+                        // incremental mean
+                        cal.lx0 += (lx - cal.lx0) / n;
+                        cal.ly0 += (ly - cal.ly0) / n;
+                        cal.rx0 += (rx - cal.rx0) / n;
+                        cal.ry0 += (ry - cal.ry0) / n;
+                    }
+                }
+
+                let now_state = parsed_to_dolphin(parsed, cal);
                 if let Err(e) = emit_state_delta(&mut pipe, prev_state, now_state, &mut last_analog_emit) {
                     if let Some(ioe) = e.downcast_ref::<io::Error>() {
                         if ioe.raw_os_error() == Some(libc::EPIPE) {
