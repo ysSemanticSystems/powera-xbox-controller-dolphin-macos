@@ -57,34 +57,26 @@ make run
 If it starts and prints `Claimed interface ...` and then `Locked GIP payload offset: ...` it is reading GIP input successfully.
 If it prints `device not found (VID=..., PID=...)`, your controller is not the supported model (or it uses a different VID/PID).
 
-## Run
+## Run (no terminal commands)
 
-On macOS, claiming a vendor-specific USB interface typically requires root privileges:
+Double-click:
+
+- `Run Dolphin Controller.command`
+
+It will open a Terminal window, prompt once for your password (sudo), then run the bridge until you quit it.
+
+To stop it, either:
+
+- Press **Ctrl+C** in the Terminal window that is running it, or
+- Double-click `Stop Dolphin Controller.command`
+
+## Run (terminal)
+
+If you prefer:
 
 ```bash
 make run
 ```
-
-## Make startup easier (auto-run at boot/login)
-
-Because this needs to be running before (or while) Dolphin reads the pipe, you can install it as a `launchd` service.
-
-1. Install the binary:
-
-```bash
-make install
-```
-
-2. Install and load the LaunchDaemon (runs as root so USB access works):
-
-```bash
-sudo cp launchd/com.yssemanticsystems.powera-dolphin-pipe.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.yssemanticsystems.powera-dolphin-pipe.plist
-```
-
-Logs:
-
-- `/var/log/powera-dolphin-pipe.log`
 
 ## Dolphin setup (Pipe backend)
 
